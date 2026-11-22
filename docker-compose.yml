@@ -7,6 +7,10 @@ services:
     environment:
       DATABASE_PATH: /data/app.db
       MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-10485760}"
+      # 产线数上限：超过后，含产线级发布值或 0 权重产线的时段不再进入通用
+      # 稠密求解器（内存随产线数平方增长），整批预览在开算前退回并列出时段。
+      # 只约束车间/工厂/层级合计且产线权重均大于 0 的时段走闭式求解，不受此限。
+      RECONCILE_MAX_LINES: "${RECONCILE_MAX_LINES:-1000}"
     volumes:
       - reconciliation-data:/data
     restart: unless-stopped

@@ -43,6 +43,10 @@ KIND_LABELS = {
     "published": "已发布车间/工厂预测",
 }
 
+# Default cap on the line count for periods that need the dense general
+# solver.  ``RECONCILE_MAX_LINES`` (see docker-compose.yml) overrides it.
+DEFAULT_MAX_LINES = 500
+
 
 def payload_hash(payload: Any) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -59,8 +63,9 @@ class UploadOutcome:
 
 
 class ReconciliationService:
-    def __init__(self, database: db_module.Database) -> None:
+    def __init__(self, database: db_module.Database, max_lines: int | None = None) -> None:
         self.db = database
+        self.max_lines = DEFAULT_MAX_LINES if max_lines is None else max(1, int(max_lines))
 
     # ------------------------------------------------------------------
     # Datasets
@@ -239,6 +244,7 @@ class ReconciliationService:
                     hierarchy,
                     forecast_payload["rows"],
                     published_payload["rows"],
+                    max_lines=self.max_lines,
                 )
                 problems = verify_consistency(result)
                 if problems:
@@ -265,11 +271,15 @@ class ReconciliationService:
         except ReconciliationError as exc:
             # Failure: nothing is stored; the last published snapshot survives.
             # `connect()` already rolled the transaction back.
+            detail = {"error_code": exc.code}
+            extra = getattr(exc, "detail", None)
+            if isinstance(extra, dict):
+                detail.update(extra)
             self._log(
                 dataset_id,
                 "preview_failed",
                 f"校正失败：{exc}",
-                {"error_code": exc.code},
+                detail,
             )
             raise
 

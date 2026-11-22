@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from .db import Database
 from .errors import ReconciliationError
 from .service import (
+    DEFAULT_MAX_LINES,
     KIND_LABELS,
     ReconciliationService,
     adjustments_to_csv,
@@ -27,10 +28,23 @@ BASE_DIR = Path(__file__).resolve().parent
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 
 
+def _max_lines_from_env() -> int:
+    """Cap on lines for periods that need the dense solver.
+
+    Configured via ``RECONCILE_MAX_LINES`` (docker-compose.yml sets it);
+    periods solvable in closed form are exempt regardless of line count.
+    """
+    raw = os.environ.get("RECONCILE_MAX_LINES", "").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_LINES
+
+
 def create_app(db_path: str | None = None) -> FastAPI:
     app = FastAPI(title="制造计划时序数据校正", version="1.0.0")
     database = Database(db_path or os.environ.get("DATABASE_PATH", "/data/app.db"))
-    service = ReconciliationService(database)
+    service = ReconciliationService(database, max_lines=_max_lines_from_env())
 
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")

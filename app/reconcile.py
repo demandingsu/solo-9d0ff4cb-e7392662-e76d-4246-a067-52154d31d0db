@@ -19,9 +19,21 @@ constraints we pick the one minimising
 where ``base_node`` for an internal node is the sum of its line descendants in
 the uploaded forecast.  Internal values are exact sums of line values, so the
 problem reduces to a weighted least-squares over line variables with linear
-equality constraints.  It is solved per period by null-space reduction: find one
-particular solution, then minimise over the null space of the constraint matrix
-with numpy.  Infeasible constraints are reported, never silently violated.
+equality constraints.
+
+Two solvers are used per period:
+
+* **Closed-form solver** — for periods whose constraints only touch shop /
+  plant totals (node pins on shops or the plant, or shop/plant level totals)
+  while every line weight is positive.  The within-shop split and the
+  shop-total balance both have closed-form solutions, so the extra memory is
+  O(lines) and no dense matrix is ever built.
+* **General solver** — null-space reduction with numpy (SVD + linear solve)
+  for everything else (line-level pins, or zero line weights).  Its memory
+  grows quadratically with the number of lines, so ``reconcile`` rejects the
+  whole batch up front when a period needs it beyond the configured line cap.
+
+Infeasible constraints are reported, never silently violated.
 """
 
 from __future__ import annotations
@@ -32,7 +44,7 @@ from typing import Any
 
 import numpy as np
 
-from .errors import OptimizationError, SnapshotValidationError
+from .errors import LineLimitExceededError, OptimizationError, SnapshotValidationError
 from .hierarchy import Hierarchy
 
 def _close(a: float, b: float, tol: float = 1e-6) -> bool:
@@ -386,17 +398,162 @@ def _solve_period(
 
 
 # ----------------------------------------------------------------------
+# Closed-form solver (memory-flat in the number of lines)
+# ----------------------------------------------------------------------
+def _is_total_constraint(constraint: dict[str, Any]) -> bool:
+    """True when the constraint only pins a shop/plant total.
+
+    Node constraints carry their node's level; level constraints name the
+    level directly.  Anything touching an individual line forces the general
+    solver.
+    """
+    return constraint.get("level") in ("shop", "plant")
+
+
+def _needs_general_solver(
+    period_constraints: list[dict[str, Any]], lines_positive: bool
+) -> bool:
+    """Periods that cannot use the closed-form solver.
+
+    Unconstrained periods need no solver at all.  The closed form requires
+    strictly positive line weights (shop totals are distributed in inverse
+    proportion to line weights) and constraints that only touch shop/plant
+    totals.
+    """
+    if not period_constraints:
+        return False
+    if not lines_positive:
+        return True
+    return any(not _is_total_constraint(c) for c in period_constraints)
+
+
+def _solve_period_fast(
+    hierarchy: Hierarchy,
+    lines: list[str],
+    line_base: dict[str, float],
+    constraints: list[dict[str, Any]],
+) -> tuple[dict[str, float], list[str]]:
+    """Closed-form solve for periods constrained only at shop/plant totals.
+
+    The weighted least-squares problem collapses once the within-shop split is
+    solved analytically: with shop total ``t`` fixed, minimising
+    ``sum w_l (x_l - b_l)^2`` over the shop's lines gives
+    ``x_l = b_l + (t - B_s) / (w_l * h_s)`` with ``h_s = sum 1/w_l`` and a
+    minimal within-shop cost of ``(t - B_s)^2 / h_s``.  Each shop therefore
+    acts as one variable with effective weight ``alpha_s = 1/h_s + W_s`` and
+    the remaining shop-total problem has a closed-form solution:
+
+    * grand total published (plant pin / plant or shop level total): the
+      unpinned shops jointly absorb the remainder in inverse proportion to
+      ``alpha_s`` (工厂总量与部分车间值同时指定时，其余车间共同补足差额);
+    * no grand total: the plant weight couples the free shops through one
+      scalar, again solved in closed form.
+
+    Only a handful of per-shop/per-line scalars are kept, so the extra memory
+    is O(lines) with no dense matrices — numpy is never touched here.
+    """
+    shops = hierarchy.by_level["shop"]
+    plant_id = hierarchy.roots[0]
+    plant_weight = float(hierarchy.nodes[plant_id].weight)
+
+    pinned: dict[str, float] = {}
+    grand_totals: list[float] = []
+    for constraint in constraints:
+        if constraint["kind"] == "node" and constraint["level"] == "shop":
+            pinned[constraint["node_id"]] = constraint["value"]
+        else:
+            # Plant node pin, plant level total and shop level total are all
+            # the grand total across every line (single-plant tree).
+            grand_totals.append(constraint["value"])
+
+    grand_total: float | None = None
+    if grand_totals:
+        grand_total = grand_totals[0]
+        for value in grand_totals[1:]:
+            if not _close(value, grand_total):
+                raise OptimizationError(
+                    "已发布预测无法同时满足（约束不相容），请核对该时段的车间/工厂发布值。"
+                )
+
+    # Per-shop aggregates: base sum and the harmonic denominator of weights.
+    shop_lines: dict[str, list[str]] = {}
+    shop_base: dict[str, float] = {}
+    shop_h: dict[str, float] = {}
+    for shop in shops:
+        members = descendant_lines(hierarchy, shop)
+        shop_lines[shop] = members
+        shop_base[shop] = sum(line_base[line] for line in members)
+        shop_h[shop] = sum(1.0 / hierarchy.nodes[line].weight for line in members)
+    # Effective weight of a shop total: within-shop cost plus the shop's own
+    # weight.  Strictly positive because line weights are positive here.
+    alpha = {
+        shop: 1.0 / shop_h[shop] + float(hierarchy.nodes[shop].weight) for shop in shops
+    }
+
+    unpinned = [shop for shop in shops if shop not in pinned]
+    pinned_sum = sum(pinned.values())
+    base_unpinned = sum(shop_base[shop] for shop in unpinned)
+    plant_base = base_unpinned + sum(shop_base[shop] for shop in pinned)
+
+    totals: dict[str, float] = dict(pinned)
+    if grand_total is not None:
+        remainder = grand_total - pinned_sum
+        if not unpinned:
+            if not _close(pinned_sum, grand_total):
+                # Normally caught while building constraints; kept as a guard.
+                raise OptimizationError(
+                    "已发布预测无法同时满足（约束不相容），请核对该时段的车间/工厂发布值。"
+                )
+        else:
+            denom = sum(1.0 / alpha[shop] for shop in unpinned)
+            shift = (remainder - base_unpinned) / denom
+            for shop in unpinned:
+                totals[shop] = shop_base[shop] + shift / alpha[shop]
+    elif unpinned:
+        # Plant deviation trades shop movement off against the plant weight.
+        denom = 1.0 + plant_weight * sum(1.0 / alpha[shop] for shop in unpinned)
+        gap = (base_unpinned + pinned_sum - plant_base) / denom
+        for shop in unpinned:
+            totals[shop] = shop_base[shop] - plant_weight * gap / alpha[shop]
+
+    corrected: dict[str, float] = {}
+    for shop in shops:
+        delta = totals[shop] - shop_base[shop]
+        h = shop_h[shop]
+        for line in shop_lines[shop]:
+            corrected[line] = line_base[line] + delta / (hierarchy.nodes[line].weight * h)
+
+    # Cheap exactness guard on the constraints (float drift safety net).
+    for constraint in constraints:
+        if constraint["kind"] == "node" and constraint["level"] == "shop":
+            actual = sum(corrected[line] for line in shop_lines[constraint["node_id"]])
+        else:
+            actual = sum(corrected[line] for line in lines)
+        if not _close(actual, constraint["value"]):
+            raise OptimizationError("校正结果未满足已发布约束。")
+
+    return corrected, []
+
+
+# ----------------------------------------------------------------------
 # Public entry point
 # ----------------------------------------------------------------------
 def reconcile(
     hierarchy: Hierarchy,
     line_rows: list[dict[str, Any]],
     published_rows: list[dict[str, Any]],
+    max_lines: int | None = None,
 ) -> ReconciliationResult:
     """Reconcile line forecasts against published aggregates.
 
     ``line_rows``: ``{node_id, period, value}``.
     ``published_rows``: ``{target, kind: 'node'|'level', period, value}``.
+    ``max_lines``: cap on the line count for periods that need the dense
+    general solver (whose memory grows quadratically with the number of
+    lines).  Periods solvable by the closed-form solver are exempt.  If any
+    period needs the general solver while the line count exceeds the cap, the
+    whole batch is rejected with :class:`LineLimitExceededError` *before* any
+    period is solved.  ``None`` disables the cap.
     """
     line_values, periods = _normalise_line_rows(hierarchy, line_rows)
     constraints, warnings = _build_constraints(hierarchy, published_rows, periods)
@@ -406,6 +563,19 @@ def reconcile(
     for constraint in constraints:
         constraints_by_period[constraint["period"]].append(constraint)
 
+    # Pick a solver per period up front.  The closed-form solver needs
+    # strictly positive line weights and constraints that only touch
+    # shop/plant totals; everything else falls back to the dense solver.
+    lines_positive = all(hierarchy.nodes[line].weight > 0 for line in lines)
+    needs_general = {
+        period: _needs_general_solver(constraints_by_period[period], lines_positive)
+        for period in periods
+    }
+    if max_lines is not None and len(lines) > max_lines:
+        blocked = [period for period in periods if needs_general[period]]
+        if blocked:
+            raise LineLimitExceededError(blocked, len(lines), max_lines)
+
     periods_out: list[PeriodResult] = []
     for period in periods:
         line_base = {line: line_values[(line, period)] for line in lines}
@@ -414,9 +584,14 @@ def reconcile(
             for node_id in sorted(hierarchy.nodes)
         }
         period_constraints = constraints_by_period[period]
-        corrected_lines, _notes = _solve_period(
-            hierarchy, lines, line_base, period_constraints
-        )
+        if needs_general[period]:
+            corrected_lines, _notes = _solve_period(
+                hierarchy, lines, line_base, period_constraints
+            )
+        else:
+            corrected_lines, _notes = _solve_period_fast(
+                hierarchy, lines, line_base, period_constraints
+            )
         corrected_all = dict(corrected_lines)
         for node in hierarchy.nodes.values():
             if node.level != "line":
@@ -511,7 +686,9 @@ def reconcile(
             ancestors = set(hierarchy.ancestors(line))
             for constraint in period_constraints:
                 if constraint["kind"] == "node":
-                    if line in descendant_lines(hierarchy, constraint["node_id"]):
+                    # A line sits under a node exactly when the node is the
+                    # line itself or one of its ancestors.
+                    if constraint["node_id"] == line or constraint["node_id"] in ancestors:
                         sources.append(constraint["label"])
                 else:
                     # A level total spans every node of that level.  It can
