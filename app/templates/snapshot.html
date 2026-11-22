@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% import "_result.html" as ui with context %}
+{% block title %}快照 v{{ snapshot.version_number }} · {{ dataset.name }}{% endblock %}
+{% block content %}
+<section class="card dataset-head">
+  <div>
+    <h1>{{ dataset.name }} · 快照 v{{ snapshot.version_number }}</h1>
+    <p class="muted">
+      发布于 {{ snapshot.created_at }} · 基于输入版本 v{{ snapshot.input_version }}
+      {% if snapshot.parent_id %} · 上一版快照 #{{ snapshot.parent_id }}{% endif %}
+    </p>
+  </div>
+  <div class="head-actions">
+    <a class="button ghost" href="/datasets/{{ dataset.id }}">返回数据集</a>
+  </div>
+</section>
+
+<section class="card">
+  {{ ui.result_tables(result, dataset.id, download_version=snapshot.version_number, readonly=True) }}
+</section>
+{% endblock %}

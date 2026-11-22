@@ -1,0 +1,138 @@
+{% macro fmt(v) %}{% if v is none %}—{% else %}{{ "%.3f"|format(v) }}{% endif %}{% endmacro %}
+
+{% macro result_tables(result, dataset_id, download_version=None, download_preview=None, readonly=False) %}
+{% set ns = namespace(adjusted=0, conflicts=0) %}
+{% for p in result.periods %}
+  {% if p.adjusted %}{% set ns.adjusted = ns.adjusted + 1 %}{% endif %}
+  {% if p.inconsistent %}{% set ns.conflicts = ns.conflicts + 1 %}{% endif %}
+{% endfor %}
+
+<div class="result-summary">
+  <span class="stat"><strong>{{ result.periods|length }}</strong> 个时段</span>
+  <span class="stat"><strong>{{ ns.adjusted }}</strong> 个时段发生调整</span>
+  <span class="stat {% if ns.conflicts %}warn{% endif %}"><strong>{{ ns.conflicts }}</strong> 个时段存在已发布值冲突</span>
+  <span class="spacer"></span>
+  {% set q = [] %}
+  {% if download_version is not none %}{% set q = q + ['version=' ~ download_version] %}{% endif %}
+  {% if download_preview is not none %}{% set q = q + ['preview=' ~ download_preview] %}{% endif %}
+  {% set qs = ('?' ~ q|join('&')) if q else '' %}
+  <a class="button ghost" href="/datasets/{{ dataset_id }}/download/snapshot.csv{{ qs }}">下载快照 CSV</a>
+  <a class="button ghost" href="/datasets/{{ dataset_id }}/download/adjustments.csv{{ qs }}">下载调整来源 CSV</a>
+  <a class="button ghost" href="/datasets/{{ dataset_id }}/download/conflicts.csv{{ qs }}">下载冲突 CSV</a>
+</div>
+
+{% if result.warnings %}
+<div class="banner banner-warn">
+  <strong>提示：</strong>
+  <ul>{% for w in result.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+{% for p in result.periods %}
+<details class="period {% if p.adjusted %}has-adjust{% endif %}" {% if p.adjusted or p.inconsistent %}open{% endif %}>
+  <summary>
+    <span class="period-label">时段 {{ p.period }}</span>
+    {% if p.inconsistent %}<span class="pill pill-warn">已发布值冲突</span>{% endif %}
+    {% if p.adjusted %}<span class="pill pill-info">{{ p.line_adjustments|length }} 条产线被调整</span>
+    {% else %}<span class="pill pill-ok">无需调整</span>{% endif %}
+  </summary>
+
+  <div class="period-body">
+    {% if p.conflicts %}
+    <h4>不一致时段明细</h4>
+    <table class="compact">
+      <thead><tr><th>范围</th><th>层级</th><th class="num">上传基线</th><th class="num">已发布</th><th class="num">差额</th></tr></thead>
+      <tbody>
+      {% for c in p.conflicts %}
+        <tr>
+          <td>{{ c.scope }}</td>
+          <td>{{ c.level }}</td>
+          <td class="num">{{ fmt(c.base) }}</td>
+          <td class="num">{{ fmt(c.published) }}</td>
+          <td class="num {{ 'neg' if c.diff < 0 else 'pos' }}">{{ fmt(c.diff) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if p.constrained %}
+    <h4>本时段已发布约束</h4>
+    <div class="chips">
+      {% for c in p.constrained %}
+        <span class="chip">{{ c.label }} = {{ fmt(c.value) }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if p.node_adjustments %}
+    <h4>调整来源（按节点）</h4>
+    <table class="compact">
+      <thead>
+        <tr>
+          <th>节点</th><th>层级</th><th>名称</th>
+          <th class="num">基线</th><th class="num">校正后</th><th class="num">变化</th>
+          <th>来源</th><th>路径</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for a in p.node_adjustments %}
+        <tr>
+          <td class="mono">{{ a.node_id }}</td>
+          <td>{{ a.level }}</td>
+          <td>{{ a.name }}</td>
+          <td class="num">{{ fmt(a.base) }}</td>
+          <td class="num">{{ fmt(a.corrected) }}</td>
+          <td class="num {{ 'pos' if a.delta > 0 else 'neg' }}">{{ fmt(a.delta) }}</td>
+          <td>
+            {% if a.source == 'published_node' %}<span class="tag tag-pub">直接发布</span>
+            {% elif a.source == 'published_level' %}<span class="tag tag-level">层级总量</span>
+            {% else %}<span class="tag tag-balance">层级平衡</span>{% endif %}
+          </td>
+          <td class="path">{{ a.path|join(' → ') }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <h4>产线调整溯源</h4>
+    <table class="compact">
+      <thead><tr><th>产线</th><th class="num">基线</th><th class="num">校正后</th><th class="num">变化</th><th>受影响来源</th></tr></thead>
+      <tbody>
+      {% for a in p.line_adjustments %}
+        <tr>
+          <td class="mono">{{ a.node_id }} <span class="muted">{{ a.name }}</span></td>
+          <td class="num">{{ fmt(a.base) }}</td>
+          <td class="num">{{ fmt(a.corrected) }}</td>
+          <td class="num {{ 'pos' if a.delta > 0 else 'neg' }}">{{ fmt(a.delta) }}</td>
+          <td>{% for s in a.source_nodes %}<span class="chip small">{{ s }}</span>{% endfor %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">该时段基线已满足所有已发布约束，未做调整。</p>
+    {% endif %}
+
+    <h4>校正后数值（各层一致）</h4>
+    <table class="compact tree">
+      <thead><tr><th>节点</th><th>层级</th><th class="num">基线</th><th class="num">校正后</th><th class="num">变化</th></tr></thead>
+      <tbody>
+      {% for node_id in result.hierarchy.by_level.plant + result.hierarchy.by_level.shop + result.hierarchy.by_level.line %}
+        {% set node = result.hierarchy.nodes[node_id] %}
+        <tr class="lvl-{{ node.level }}">
+          <td class="mono" style="padding-left: {{ 8 + (node.level == 'shop' and 18 or 0) + (node.level == 'line' and 36 or 0) }}px">{{ node_id }}</td>
+          <td>{{ node.level }}</td>
+          <td class="num">{{ fmt(p.base[node_id]) }}</td>
+          <td class="num">{{ fmt(p.corrected[node_id]) }}</td>
+          <td class="num {{ 'pos' if p.deltas.get(node_id, 0) > 0 else ('neg' if p.deltas.get(node_id, 0) < 0 else '') }}">
+            {% if p.deltas.get(node_id) is not none %}{{ fmt(p.deltas.get(node_id)) }}{% else %}0{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</details>
+{% endfor %}
+{% endmacro %}

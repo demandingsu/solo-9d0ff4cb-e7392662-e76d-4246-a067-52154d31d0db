@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}数据集 · 时序校正{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>数据集</h1>
+  <p class="muted">每个数据集包含一套产线→车间→工厂映射、一份产线预测与一份已发布的车间/工厂预测。</p>
+  <form method="post" action="/datasets" class="inline-form">
+    <input type="text" name="name" placeholder="例如：2026 年 1 月 华东工厂" required maxlength="80">
+    <button type="submit">新建数据集</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>已有数据集</h2>
+  {% if datasets %}
+  <table>
+    <thead><tr><th>#</th><th>名称</th><th>创建时间</th><th>输入版本</th><th></th></tr></thead>
+    <tbody>
+    {% for d in datasets %}
+      <tr>
+        <td>{{ d.id }}</td>
+        <td>{{ d.name }}</td>
+        <td class="mono">{{ d.created_at }}</td>
+        <td><span class="pill">v{{ d.input_version }}</span></td>
+        <td><a href="/datasets/{{ d.id }}">打开</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">还没有数据集，先在上方新建一个。</p>
+  {% endif %}
+</section>
+{% endblock %}

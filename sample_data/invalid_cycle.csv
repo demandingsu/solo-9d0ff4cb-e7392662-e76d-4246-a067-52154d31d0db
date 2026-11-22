@@ -1,0 +1,4 @@
+node_id,parent_id,level,name,weight
+P1,,plant,华东工厂,1
+S1,L1,shop,冲压车间,1
+L1,S1,line,冲压一线,1

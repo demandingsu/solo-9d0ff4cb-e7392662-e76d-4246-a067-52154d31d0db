@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% import "_result.html" as ui with context %}
+{% block title %}{{ dataset.name }} · 时序校正{% endblock %}
+{% block content %}
+<section class="card dataset-head">
+  <div>
+    <h1>{{ dataset.name }}</h1>
+    <p class="muted">数据集 #{{ dataset.id }} · 当前输入版本 <span class="pill">v{{ dataset.input_version }}</span></p>
+  </div>
+  <div class="head-actions">
+    <a class="button ghost" href="/">返回列表</a>
+  </div>
+</section>
+
+{% if request.query_params.get('message') %}
+<div class="banner banner-ok">{{ request.query_params.get('message') }}</div>
+{% endif %}
+{% if request.query_params.get('published') %}
+<div class="banner banner-ok">已发布快照 v{{ request.query_params.get('published') }}，可在下方历史快照中查看。</div>
+{% endif %}
+
+<section class="grid two">
+  <div class="card">
+    <h2>1. 上传输入</h2>
+    <p class="muted">上传会更新输入版本并使旧预览失效。映射结构不合法时整次上传被拒绝，不会破坏已有结果。</p>
+
+    {% for kind, label, hint in [
+        ('mapping', '层级映射 CSV', '列：node_id, parent_id, level, name, weight（parent_id 为空即根）'),
+        ('line_forecast', '产线预测 CSV', '列：node_id, period, value'),
+        ('published', '已发布车间/工厂预测 CSV', '列：node_id 或 level, period, value')
+    ] %}
+    {% set rev = revisions.get(kind) %}
+    <form class="upload" method="post" action="/datasets/{{ dataset.id }}/upload" enctype="multipart/form-data">
+      <div class="upload-head">
+        <strong>{{ label }}</strong>
+        {% if rev %}
+          <span class="pill pill-ok">已上传 v{{ rev.input_version }}</span>
+        {% else %}
+          <span class="pill">未上传</span>
+        {% endif %}
+      </div>
+      <p class="muted small">{{ hint }}</p>
+      {% if rev %}
+      <p class="file-meta">
+        当前文件：<span class="mono">{{ rev.filename or '—' }}</span>
+        · {{ rev.payload.row_count }} 行
+        · <span class="mono small">sha256 {{ rev.content_hash[:12] }}…</span>
+      </p>
+      {% endif %}
+      <input type="hidden" name="kind" value="{{ kind }}">
+      <div class="row">
+        <input type="file" name="file" accept=".csv,text/csv" required>
+        <button type="submit">上传</button>
+      </div>
+    </form>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>2. 校正与发布</h2>
+    <p class="muted">
+      校正按节点权重最小化加权调整平方和，使产线、车间、工厂各层数量一致，并满足已发布值。
+      校正失败不会写入快照，上一版发布结果保持不变。
+    </p>
+    {% set missing = [] %}
+    {% if 'mapping' not in revisions %}{% set _ = missing.append('层级映射') %}{% endif %}
+    {% if 'line_forecast' not in revisions %}{% set _ = missing.append('产线预测') %}{% endif %}
+    {% if missing %}
+      <div class="banner banner-warn">还缺少：{{ missing|join('、') }}</div>
+    {% endif %}
+
+    <form method="post" action="/datasets/{{ dataset.id }}/preview">
+      <button type="submit" class="primary" {% if missing %}disabled{% endif %}>运行校正（生成预览）</button>
+    </form>
+
+    {% if preview %}
+    <div class="preview-state {% if preview.stale %}stale{% endif %}">
+      <h3>最新预览 #{{ preview.id }}</h3>
+      <p class="muted small">
+        生成于 {{ preview.created_at }} · 基于输入版本 v{{ preview.input_version }}
+      </p>
+      {% if preview.stale %}
+        <div class="banner banner-warn">
+          <strong>预览已过期。</strong>
+          输入在预览之后发生了变更（当前 v{{ dataset.input_version }}），旧预览不得发布。请重新运行校正。
+        </div>
+      {% else %}
+        <form method="post" action="/datasets/{{ dataset.id }}/publish" class="inline-form">
+          <input type="hidden" name="preview_id" value="{{ preview.id }}">
+          <button type="submit" class="primary">发布此预览为快照</button>
+        </form>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <h3 class="mt">已发布快照</h3>
+    {% if snapshots %}
+    <table class="compact">
+      <thead><tr><th>版本</th><th>发布时间</th><th>输入版本</th><th></th></tr></thead>
+      <tbody>
+      {% for s in snapshots %}
+        <tr>
+          <td><span class="pill pill-ok">v{{ s.version_number }}</span></td>
+          <td class="mono">{{ s.created_at }}</td>
+          <td>v{{ s.input_version }}</td>
+          <td class="actions">
+            <a href="/datasets/{{ dataset.id }}/snapshots/{{ s.version_number }}">查看</a>
+            <a href="/datasets/{{ dataset.id }}/download/snapshot.csv?version={{ s.version_number }}">CSV</a>
+            <a href="/datasets/{{ dataset.id }}/download/adjustments.csv?version={{ s.version_number }}">调整来源</a>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">尚无已发布快照。</p>
+    {% endif %}
+  </div>
+</section>
+
+{% if preview %}
+<section class="card">
+  <h2>3. 预览结果 {% if preview.stale %}<span class="pill pill-warn">已过期，仅供查看</span>{% endif %}</h2>
+  {{ ui.result_tables(preview.result, dataset.id, download_preview=preview.id) }}
+</section>
+{% endif %}
+
+{% if latest_snapshot %}
+<section class="card">
+  <h2>当前生效快照 v{{ latest_snapshot.version_number }}</h2>
+  {{ ui.result_tables(latest_snapshot.result, dataset.id, download_version=latest_snapshot.version_number) }}
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>操作记录</h2>
+  {% if events %}
+  <table class="compact">
+    <thead><tr><th>时间</th><th>类型</th><th>说明</th></tr></thead>
+    <tbody>
+    {% for e in events %}
+      <tr>
+        <td class="mono">{{ e.created_at }}</td>
+        <td><span class="tag tag-{{ e.kind.split('_')[0] }}">{{ e.kind }}</span></td>
+        <td>{{ e.message }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">暂无记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

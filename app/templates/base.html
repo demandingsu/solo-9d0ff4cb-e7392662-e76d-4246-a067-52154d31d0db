@@ -1,0 +1,25 @@
+{% macro nav() %}{% endmacro %}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}制造计划时序数据校正{% endblock %}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">制造计划 · 时序数据校正</a>
+  <nav>
+    <a href="/">数据集</a>
+    <a href="/docs" target="_blank" rel="noreferrer">API</a>
+  </nav>
+</header>
+<main>
+  {% if error %}<div class="banner banner-error"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
+  {% if message %}<div class="banner banner-ok">{{ message }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+<footer class="footer">层级：产线 → 车间 → 工厂 · 加权最小二乘校正 · 快照不可变</footer>
+</body>
+</html>

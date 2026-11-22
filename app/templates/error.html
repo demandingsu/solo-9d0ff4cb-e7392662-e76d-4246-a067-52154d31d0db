@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}出错了{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>操作失败</h1>
+  <p class="mono muted">错误代码：{{ code }}</p>
+  <div class="banner banner-error">{{ message }}</div>
+  <p><a class="button ghost" href="/">返回数据集列表</a></p>
+</section>
+{% endblock %}
